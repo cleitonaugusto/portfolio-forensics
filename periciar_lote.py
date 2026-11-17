@@ -35,6 +35,7 @@ from twolayers import linha_do_tempo, peca  # noqa: E402
 
 RE_DATA = re.compile(r"\b(\d{2})/(\d{2})/(\d{4})\b")
 RE_VALOR = re.compile(r"(-?)R\$\s*([\d.]+,\d{2})")
+RE_CPF = re.compile(r"\b\d{3}\.\d{3}\.\d{3}-\d{2}\b")
 MIN_GRUPO = 3            # menor grupo entre arquivos que vale reportar
 TETO_COMUM = 0.5         # imagem em mais da metade da família = logotipo/modelo do emissor, não reaproveitamento
 FOLGA_DATA = 90          # dias: datas no texto até aqui depois da criação são vencimento/prazo, não anacronismo
@@ -57,8 +58,19 @@ def _ler_paginas(caminho: Path) -> dict:
     from pdfminer.pdftypes import resolve1
     from pdfminer.psparser import literal_name
 
+    class _FonteDeclarada(PDFResourceManager):
+        """O pdfminer troca o nome de fontes 'equivalentes' (Arial vira Helvetica, pelas métricas). Para a perícia
+        vale o nome declarado no dicionário da fonte (/BaseFont), que é o que o programa gerador escreveu."""
+
+        def get_font(self, objid, spec):
+            fonte = super().get_font(objid, spec)
+            bf = resolve1(spec.get("BaseFont")) if hasattr(spec, "get") else None
+            if bf is not None:
+                fonte.fontname = literal_name(bf) if not isinstance(bf, bytes) else bf.decode("latin-1")
+            return fonte
+
     linhas, imagens, cabecalho, area_img, area_pag = [], {}, set(), 0.0, 0.0
-    rm = PDFResourceManager()
+    rm = _FonteDeclarada()
     dev = PDFPageAggregator(rm, laparams=LAParams())
     interp = PDFPageInterpreter(rm, dev)
 
@@ -101,12 +113,21 @@ def _hash_perceptual(stream, dados: bytes) -> str | None:
     """Máscara de tinta: a imagem é reduzida a uma grade 64x24 e cada célula vira 1 se tem traço escuro (<128).
     Feita para traço fino sobre fundo claro (assinatura, rubrica, carimbo). A comparação (_semelhanca) engrossa o
     traço e procura a melhor sobreposição com deslocamento, para reconhecer a mesma assinatura recortada de novo.
-    Só imagens em cinza ou RGB não comprimidas após a decodificação do PDF; JPEG/JPX devolve None (limite declarado)."""
+    Imagens em cinza ou RGB; JPEG (digitalização) é decodificado com o Pillow. Sem o Pillow, ou em JPX/CCITT/JBIG2,
+    devolve None e a imagem só agrupa por bytes idênticos (limite declarado)."""
     w, h = stream.attrs.get("Width"), stream.attrs.get("Height")
     try:
         w, h = int(w), int(h)
     except (TypeError, ValueError):
         return None
+    if dados[:2] == b"\xff\xd8":  # o pdfminer entrega o JPEG (DCTDecode) ainda codificado
+        try:
+            import io
+            from PIL import Image
+            img = Image.open(io.BytesIO(dados)).convert("L")
+        except Exception:  # sem Pillow ou JPEG ruim: fica no limite declarado
+            return None
+        w, h, dados = img.width, img.height, img.tobytes()
     canais = len(dados) // (w * h) if w and h else 0
     if canais not in (1, 3) or len(dados) != w * h * canais:
         return None
@@ -188,6 +209,10 @@ def examinar(caminho: str) -> dict:
         r["imagens_cabecalho"] = pag["cabecalho"]
         texto = "\n".join(l["texto"] for l in pag["linhas"])
         palavras = len(texto.split())
+        # titular = 1º CPF do texto, guardado só como hash: duas assinaturas parecidas da MESMA pessoa não são
+        # reaproveitamento (a pessoa assinou de novo); o laudo não precisa do CPF em claro
+        cpf = RE_CPF.search(texto)
+        r["titular"] = hashlib.sha256(re.sub(r"\D", "", cpf.group()).encode()).hexdigest()[:16] if cpf else None
         if pag["cobertura_imagem"] >= 0.9 and palavras < 40:
             r["sinais"]["pagina_e_imagem"] = {"cobertura": pag["cobertura_imagem"], "palavras": palavras}
 
@@ -285,11 +310,12 @@ def agrupar(exames: list[dict], raiz: Path) -> tuple[list[dict], dict]:
                 refs.append([ph, list(ds), {h}, h])
         for _, ds, variantes, chave in refs:
             ds = list({id(x): x for x in ds}.values())
-            if MIN_GRUPO <= len(ds) <= TETO_COMUM * len(docs):
+            pessoas = {x.get("titular") or id(x) for x in ds}  # sem CPF no texto, cada documento conta como uma pessoa
+            if MIN_GRUPO <= len(pessoas) and len(ds) <= TETO_COMUM * len(docs):
                 modo = "bytes idênticos" if len(variantes) == 1 else f"{len(variantes)} cópias com bytes diferentes, visualmente iguais"
                 grupos.append({"tipo": "imagem_reaproveitada", "familia": fam, "chave": chave[:16], "docs": ds,
                                "leitura": f"a mesma imagem fora do cabeçalho ({modo}) aparece em {len(ds)} "
-                                          f"documentos '{fam}' de ações diferentes"})
+                                          f"documentos '{fam}' de {len(pessoas)} titulares diferentes (CPF)"})
         # produtor estranho em série (sem prova de alteração): triagem para pedir os originais ao emissor
         por_estranho = collections.defaultdict(list)
         for d in docs:
@@ -419,7 +445,11 @@ def relatorio_md(raiz, exames, grupos, padrao, medicao) -> str:
             "- Regravação sem mudança de conteúdo e produtor diferente são REVISAR, não RISCO (edição não é fraude).",
             "- Página que é só imagem é INCONCLUSIVO: pedir o original ao emissor.",
             "- A regra de saldo vale para extratos com 'SALDO ANTERIOR' e 'SALDO EM'; outros formatos precisam de regra própria.",
-            "- Imagem presente em mais da metade da família é tratada como logotipo/modelo do emissor e não agrupa."]
+            "- Imagem presente em mais da metade da família é tratada como logotipo/modelo do emissor e não agrupa.",
+            "- Assinatura reaproveitada conta titulares distintos pelo 1º CPF do texto; documento cujo 1º CPF não é o "
+            "de quem assina precisa de regra própria.",
+            "- JPEG é comparado a olho só com o Pillow instalado; JPX, CCITT e JBIG2 só agrupam por bytes idênticos.",
+            "- A fonte é a declarada no PDF (/BaseFont), não o nome normalizado pela biblioteca de extração."]
     return "\n".join(out) + "\n"
 
 
