@@ -20,6 +20,7 @@ Internal notes, preregistrations and result files are in Portuguese, as they wer
 | `pesquisa/corpus_fraude/pre-registro-v*.md` | preregistrations, committed before each blind corpus |
 | `pesquisa/corpus_fraude/resultado-cego-v*.md` | blind results (first run, never overwritten) |
 | `pesquisa/corpus_fraude/resultado-ajuste-v*.md` | results after adjustment (not blind) |
+| `frozen/periciar_lote_v1_blind.py`, `frozen/periciar_lote_v2_blind.py` | the exact tool files used in each blind round (same SHA-256 as above) |
 
 ## Frozen tool versions
 
@@ -38,7 +39,7 @@ Preregistration timestamps are git commit times in the author's repository; they
 ## Reproducing
 
 Requirements: Python ≥ 3.10, `pdfminer.six==20260107`, `Pillow==12.3.0`, and the `twolayers` package
-(https://github.com/cleitonaugusto/twolayers, commit `787d133`, v0.19.1), from which the tool uses the PDF revision
+(https://github.com/cleitonaugusto/twolayers, commit `787d133`, v0.19.1; during anonymous review, use the second link given in the manuscript), from which the tool uses the PDF revision
 timeline and hidden-text modules.
 
 ```bash
@@ -50,8 +51,8 @@ export AUDITAR_MCP_SRC=$PWD/twolayers/src
 .venv/bin/python -I pesquisa/corpus_fraude/gerar_v2.py /tmp/v2
 .venv/bin/python periciar_lote.py /tmp/v2/lote --saida /tmp/v2/laudo --gabarito /tmp/v2/gabarito.json
 
-# a blind round with a frozen version
-git show 6f678d2:periciar_lote.py > /tmp/periciar_lote_v2cego.py
+# repeat the v2 blind round with the frozen tool (expected: precision 1.0, recall 0.417)
+.venv/bin/python frozen/periciar_lote_v2_blind.py /tmp/v2/lote --saida /tmp/v2/laudo-cego --gabarito /tmp/v2/gabarito.json
 ```
 
 ## License
