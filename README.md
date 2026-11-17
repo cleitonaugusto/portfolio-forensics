@@ -38,14 +38,13 @@ Preregistration timestamps are git commit times in the author's repository; they
 
 ## Reproducing
 
-Requirements: Python ≥ 3.10, `pdfminer.six==20260107`, `Pillow==12.3.0`, and the `twolayers` package
-(https://github.com/cleitonaugusto/twolayers, commit `787d133`, v0.19.1; during anonymous review, use the second link given in the manuscript), from which the tool uses the PDF revision
-timeline and hidden-text modules.
+Requirements: Python ≥ 3.10 (runs used 3.10.12), `pdfminer.six==20260107`, `Pillow==12.3.0`, `pypdfium2==5.14.0`.
+The `twolayers` modules the tool uses (PDF revision timeline and hidden text) are vendored, unmodified, in
+`third_party/twolayers` (commit `787d133`, v0.19.1, same license).
 
 ```bash
-git clone https://github.com/cleitonaugusto/twolayers && git -C twolayers checkout 787d133
-python3 -m venv .venv && .venv/bin/pip install pdfminer.six==20260107 Pillow==12.3.0
-export AUDITAR_MCP_SRC=$PWD/twolayers/src
+python3 -m venv .venv && .venv/bin/pip install pdfminer.six==20260107 Pillow==12.3.0 pypdfium2==5.14.0
+export AUDITAR_MCP_SRC=$PWD/third_party
 
 # generate a corpus (deterministic: same seed, same bytes) and examine it
 .venv/bin/python -I pesquisa/corpus_fraude/gerar_v2.py /tmp/v2
