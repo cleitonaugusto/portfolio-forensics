@@ -38,6 +38,8 @@ RE_VALOR = re.compile(r"(-?)R\$\s*([\d.]+,\d{2})")
 MIN_GRUPO = 3            # menor grupo entre arquivos que vale reportar
 TETO_COMUM = 0.5         # imagem em mais da metade da família = logotipo/modelo do emissor, não reaproveitamento
 FOLGA_DATA = 90          # dias: datas no texto até aqui depois da criação são vencimento/prazo, não anacronismo
+FAIXA_CABECALHO = 0.15   # imagem cujo topo está nos 15% superiores da página = timbre/logotipo (material do emissor)
+SEMELHANCA_MIN = 0.80    # sobreposição mínima das máscaras de tinta para "a mesma imagem a olho" (calibrado à parte)
 
 
 # ------------------------------------------------------------------------------------------- exame individual
@@ -55,23 +57,30 @@ def _ler_paginas(caminho: Path) -> dict:
     from pdfminer.pdftypes import resolve1
     from pdfminer.psparser import literal_name
 
-    linhas, imagens, area_img, area_pag = [], [], 0.0, 0.0
+    linhas, imagens, cabecalho, area_img, area_pag = [], {}, set(), 0.0, 0.0
     rm = PDFResourceManager()
     dev = PDFPageAggregator(rm, laparams=LAParams())
     interp = PDFPageInterpreter(rm, dev)
+
+    def _imagens(el, altura):
+        for filho in (el if isinstance(el, LTFigure) else []):
+            yield from _imagens(filho, altura)
+        if isinstance(el, LTImage):
+            dados = el.stream.get_data()
+            h = hashlib.sha256(dados).hexdigest()
+            imagens[h] = _hash_perceptual(el.stream, dados)
+            if el.y1 >= altura * (1 - FAIXA_CABECALHO):  # faixa superior: timbre/logotipo do emissor
+                cabecalho.add(h)
+
     with open(caminho, "rb") as f:
         for pagina in PDFPage.get_pages(f):
             x0, y0, x1, y1 = pagina.mediabox
             area_pag += (x1 - x0) * (y1 - y0)
-            xobjs = resolve1((pagina.resources or {}).get("XObject", {})) or {}
-            for nome, ref in xobjs.items():
-                s = resolve1(ref)
-                if getattr(s, "attrs", {}).get("Subtype") is not None and literal_name(s.attrs["Subtype"]) == "Image":
-                    imagens.append(hashlib.sha256(s.get_data()).hexdigest())
             interp.process_page(pagina)
             for el in dev.get_result():
                 if isinstance(el, (LTImage, LTFigure)):
                     area_img = max(area_img, el.width * el.height)
+                    list(_imagens(el, y1 - y0))
                 if isinstance(el, LTTextBox):
                     for ln in el:
                         if isinstance(ln, LTTextLine):
@@ -79,8 +88,66 @@ def _ler_paginas(caminho: Path) -> dict:
                             if fontes:
                                 linhas.append({"texto": ln.get_text().strip(), "fonte": fontes.most_common(1)[0][0],
                                                "tam": round(max(c.size for c in ln if isinstance(c, LTChar)), 1)})
-    return {"linhas": linhas, "imagens": sorted(set(imagens)),
+    return {"linhas": linhas, "imagens": imagens, "cabecalho": sorted(cabecalho),
             "cobertura_imagem": round(area_img / area_pag, 2) if area_pag else 0}
+
+
+GRADE_TINTA = (64, 24)   # colunas x linhas da máscara de tinta
+FOLGA_LINHA = 4          # bits vazios no fim de cada linha da máscara, para deslocar sem "vazar" para a linha vizinha
+DESLOC_MAX = 2           # células de deslocamento toleradas na comparação
+
+
+def _hash_perceptual(stream, dados: bytes) -> str | None:
+    """Máscara de tinta: a imagem é reduzida a uma grade 64x24 e cada célula vira 1 se tem traço escuro (<128).
+    Feita para traço fino sobre fundo claro (assinatura, rubrica, carimbo). A comparação (_semelhanca) engrossa o
+    traço e procura a melhor sobreposição com deslocamento, para reconhecer a mesma assinatura recortada de novo.
+    Só imagens em cinza ou RGB não comprimidas após a decodificação do PDF; JPEG/JPX devolve None (limite declarado)."""
+    w, h = stream.attrs.get("Width"), stream.attrs.get("Height")
+    try:
+        w, h = int(w), int(h)
+    except (TypeError, ValueError):
+        return None
+    canais = len(dados) // (w * h) if w and h else 0
+    if canais not in (1, 3) or len(dados) != w * h * canais:
+        return None
+    gx, gy = GRADE_TINTA
+    celulas = [0] * (gx * gy)
+    for y in range(h):
+        cy = min(gy - 1, y * gy // h)
+        for x in range(w):
+            i = (y * w + x) * canais
+            v = dados[i] if canais == 1 else (dados[i] + dados[i + 1] + dados[i + 2]) // 3
+            if v < 128:
+                celulas[cy * gx + min(gx - 1, x * gx // w)] += 1
+    largura = gx + FOLGA_LINHA
+    v = 0
+    for cy in range(gy):
+        for cx in range(gx):
+            if celulas[cy * gx + cx]:
+                v |= 1 << (cy * largura + cx + FOLGA_LINHA // 2)
+    return f"{v:x}"
+
+
+def _engrossar(m: int) -> int:
+    largura = GRADE_TINTA[0] + FOLGA_LINHA
+    m |= (m << 1) | (m >> 1)
+    return m | (m << largura) | (m >> largura)
+
+
+def _semelhanca(a: str, b: str) -> float:
+    """Maior sobreposição (interseção/união) entre as máscaras engrossadas, deslocando b até DESLOC_MAX células."""
+    largura = GRADE_TINTA[0] + FOLGA_LINHA
+    ma, mb = _engrossar(int(a, 16)), _engrossar(int(b, 16))
+    ca, cb = bin(ma).count("1"), bin(mb).count("1")
+    if not ca or not cb or min(ca, cb) / max(ca, cb) < 0.6:
+        return 0.0
+    melhor = 0.0
+    for dy in range(-DESLOC_MAX, DESLOC_MAX + 1):
+        for dx in range(-DESLOC_MAX, DESLOC_MAX + 1):
+            s = dy * largura + dx
+            mbs = mb << s if s >= 0 else mb >> -s
+            melhor = max(melhor, bin(ma & mbs).count("1") / bin(ma | mbs).count("1"))
+    return melhor
 
 
 def _data_iso(s: str | None) -> datetime | None:
@@ -116,7 +183,9 @@ def examinar(caminho: str) -> dict:
 
         pag = _ler_paginas(p)
         r["fontes_linhas"] = collections.Counter(l["fonte"] for l in pag["linhas"])
-        r["imagens"] = pag["imagens"]
+        # só imagens fora do cabeçalho entram na busca de reaproveitamento (assinatura, carimbo, rubrica)
+        r["imagens"] = {h: ph for h, ph in pag["imagens"].items() if h not in pag["cabecalho"]}
+        r["imagens_cabecalho"] = pag["cabecalho"]
         texto = "\n".join(l["texto"] for l in pag["linhas"])
         palavras = len(texto.split())
         if pag["cobertura_imagem"] >= 0.9 and palavras < 40:
@@ -146,6 +215,11 @@ def examinar(caminho: str) -> dict:
                 lanc.append((datetime(int(m.group(3)), int(m.group(2)), int(m.group(1))), _valor(*v[-1])))
         if len(lanc) >= 3 and any(b[0] < a[0] for a, b in zip(lanc, lanc[1:])):
             r["sinais"]["ordem_cronologica_quebrada"] = True
+        # lançamento é fato passado: não pode ser posterior à criação do arquivo (sem folga, além de 1 dia de fuso)
+        if criado and lanc and (max(d for d, _ in lanc) - criado).days >= 1 \
+                and "criado_antes_das_datas_do_texto" not in r["sinais"]:
+            r["sinais"]["criado_antes_das_datas_do_texto"] = {"criado": criado.date().isoformat(),
+                                                             "lancamento_mais_recente": max(d for d, _ in lanc).date().isoformat()}
         # regra de exemplo para extratos: saldo anterior + lançamentos = saldo final
         ant = [l for l in pag["linhas"] if "SALDO ANTERIOR" in l["texto"].upper()]
         fim = [l for l in pag["linhas"] if l["texto"].upper().startswith("SALDO EM")]
@@ -192,16 +266,41 @@ def agrupar(exames: list[dict], raiz: Path) -> tuple[list[dict], dict]:
                 d["sinais"]["fonte_fora_do_padrao_da_familia"] = raras
             if d["meta"]["produtor"] != prod:
                 d["sinais"]["produtor_fora_do_padrao_da_familia"] = d["meta"]["produtor"]
-        # mesma imagem em vários documentos
-        por_img = collections.defaultdict(list)
+        # mesma imagem (idêntica ou visualmente igual) fora do cabeçalho em vários documentos
+        # refs: [máscara representante ou None, documentos, variantes de bytes, sha representante]
+        refs: list[list] = []
+        por_byte = collections.defaultdict(list)
         for d in docs:
-            for h in d["imagens"]:
-                por_img[h].append(d)
-        for h, ds in por_img.items():
+            for h, ph in d["imagens"].items():
+                por_byte[(h, ph)].append(d)
+        for (h, ph), ds in por_byte.items():
+            if ph:
+                alvo = next((rf for rf in refs if rf[0] and _semelhanca(rf[0], ph) >= SEMELHANCA_MIN), None)
+            else:  # imagem que não dá para comparar a olho: só bytes idênticos
+                alvo = next((rf for rf in refs if rf[0] is None and rf[3] == h), None)
+            if alvo:
+                alvo[1].extend(ds)
+                alvo[2].add(h)
+            else:
+                refs.append([ph, list(ds), {h}, h])
+        for _, ds, variantes, chave in refs:
+            ds = list({id(x): x for x in ds}.values())
             if MIN_GRUPO <= len(ds) <= TETO_COMUM * len(docs):
-                grupos.append({"tipo": "imagem_reaproveitada", "familia": fam, "chave": h[:16], "docs": ds,
-                               "leitura": f"a mesma imagem (bytes idênticos) aparece em {len(ds)} documentos "
-                                          f"'{fam}' de ações diferentes"})
+                modo = "bytes idênticos" if len(variantes) == 1 else f"{len(variantes)} cópias com bytes diferentes, visualmente iguais"
+                grupos.append({"tipo": "imagem_reaproveitada", "familia": fam, "chave": chave[:16], "docs": ds,
+                               "leitura": f"a mesma imagem fora do cabeçalho ({modo}) aparece em {len(ds)} "
+                                          f"documentos '{fam}' de ações diferentes"})
+        # produtor estranho em série (sem prova de alteração): triagem para pedir os originais ao emissor
+        por_estranho = collections.defaultdict(list)
+        for d in docs:
+            if d["meta"]["produtor"] not in (prod, None) and d["versoes"] == 1 and "pagina_e_imagem" not in d["sinais"]:
+                por_estranho[d["meta"]["produtor"]].append(d)
+        for k, ds in por_estranho.items():
+            if len(ds) >= MIN_GRUPO:
+                grupos.append({"tipo": "produtor_estranho_em_serie", "familia": fam, "chave": k, "docs": ds,
+                               "leitura": f"{len(ds)} documentos '{fam}' gerados por '{k}' e não pelo emissor habitual "
+                                          f"({prod}), sem versão anterior dentro: o arquivo sozinho não prova "
+                                          f"alteração — pedir os originais ao emissor"})
         # mesmo modelo: produtor+autor+data de criação idênticos, em documentos que JÁ NASCERAM fora do emissor
         # habitual (o editado depois guarda a data de criação do original e não é modelo)
         por_modelo = collections.defaultdict(list)
@@ -223,7 +322,8 @@ def agrupar(exames: list[dict], raiz: Path) -> tuple[list[dict], dict]:
             if len(ds) >= MIN_GRUPO:
                 grupos.append({"tipo": "edicao_em_serie", "familia": fam, "chave": " -> ".join(map(str, k)), "docs": ds,
                                "leitura": f"{len(ds)} documentos '{fam}' emitidos por '{k[0]}' e alterados depois "
-                                          f"em '{k[1]}', com mudança de conteúdo"})
+                                          + (f"em '{k[1]}'" if k[0] != k[1] else "pelo mesmo programa (que se identifica "
+                                             "como o emissor)") + ", com mudança de conteúdo entre as versões"})
     for i, g in enumerate(grupos, 1):
         g["id"] = f"L{i}"
         g["acoes"] = sorted({_acao(d["arquivo"], raiz) for d in g["docs"]})
@@ -267,6 +367,7 @@ def medir(exames: list[dict], grupos: list[dict], raiz: Path, gabarito: Path) ->
             m["inconclusivo_certo" if c == "INCONCLUSIVO" else "inconclusivo_errado"] += 1
         elif g["adulterado"]:
             m["vp" if c == "RISCO" else "fn"] += 1
+            m["adulterado_em_revisar"] += c == "REVISAR"
             if c != "RISCO":
                 erros_ex["perdidos"].append(d["arquivo"])
         else:
@@ -286,7 +387,9 @@ def medir(exames: list[dict], grupos: list[dict], raiz: Path, gabarito: Path) ->
         melhor = max(((len(acoes & set(x["acoes"])) / len(acoes | set(x["acoes"])), x["id"]) for x in grupos),
                      default=(0, None))
         rec_grupos[gr] = {"acoes": len(acoes), "melhor_grupo": melhor[1], "jaccard": round(melhor[0], 3)}
+    tri = (m["vp"] + m["adulterado_em_revisar"]) / (m["vp"] + m["fn"]) if m["vp"] + m["fn"] else None
     return {"contagem": dict(m), "precisao": prec and round(prec, 3), "revocacao": rec and round(rec, 3),
+            "triagem_risco_ou_revisar": tri and round(tri, 3),
             "grupos": rec_grupos, "exemplos_de_erro": {k: v[:10] for k, v in erros_ex.items()}}
 
 
